@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, abort
 from enum import Enum
 from datetime import datetime
 import uuid
@@ -42,16 +42,14 @@ class DemandResponseEvent:
 
 # Convert JSON to DemandResponseEvent
 def parse_event_data(data):
-    
-    # Handle datetime strings
-    if isinstance(data['start_time'], str):
+    try:
         data['start_time'] = datetime.fromisoformat(data['start_time'])
-    if isinstance(data['end_time'], str):
         data['end_time'] = datetime.fromisoformat(data['end_time'])
-    
-    # Handle event level
-    if isinstance(data['level'], str):
         data['level'] = EventLevel(data['level'])
+    except KeyError as e:
+        raise ValueError(f"Missing required field: {e.args[0]}")
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"Invalid input: {str(e)}")
     
     return DemandResponseEvent(**data)
 
@@ -61,14 +59,17 @@ def create_event():
     
     data = request.get_json()
     
+    if not data:
+        abort(400, description="No input provided")
+    
     try:
         event = parse_event_data(data)
-        events_db.append(event)
-        return jsonify(event.to_dict())
     except ValueError as e:
-        return jsonify({"error": str(e)}), 400
-    except Exception as e:
-        return jsonify({"error": f"Invalid event data: {str(e)}"}), 400
+        abort(400, description=str(e))
+    
+    events_db.append(event)
+    
+    return jsonify(event.to_dict()), 200
 
 # Get current active events
 @app.route("/events/active", methods=["GET"])
