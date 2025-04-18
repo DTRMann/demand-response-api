@@ -7,7 +7,7 @@ from dataclasses import dataclass, field, asdict
 
 app = Flask(__name__)
 
-# In-memory storage for events
+# Events database
 events_db = []
 
 class EventLevel(str, Enum):
@@ -19,14 +19,19 @@ class DemandResponseEvent:
     level: EventLevel
     start_time: datetime
     end_time: datetime
+    requesting_entity: str  # Required field for requesting entity
     timezone: str = "UTC"  # Default timezone
     message: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)  # Flexible metadata field
     id: str = None
-
+    
     def __post_init__(self):
         if self.id is None:
             self.id = str(uuid.uuid4())
+        
+        # Validate required requesting_entity field
+        if not self.requesting_entity:
+            raise ValueError("requesting_entity is required")
     
     def to_dict(self):
         result = asdict(self)
@@ -35,8 +40,9 @@ class DemandResponseEvent:
         result['end_time'] = self.end_time.isoformat()
         return result
 
-# Helper function to convert JSON to DemandResponseEvent
+# Convert JSON to DemandResponseEvent
 def parse_event_data(data):
+    
     # Handle datetime strings
     if isinstance(data['start_time'], str):
         data['start_time'] = datetime.fromisoformat(data['start_time'])
@@ -52,67 +58,73 @@ def parse_event_data(data):
 # Create a new demand response event
 @app.route("/events/", methods=["POST"])
 def create_event():
+    
     data = request.get_json()
-    event = parse_event_data(data)
-    events_db.append(event)
-    return jsonify(event.to_dict())
+    
+    try:
+        event = parse_event_data(data)
+        events_db.append(event)
+        return jsonify(event.to_dict())
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"error": f"Invalid event data: {str(e)}"}), 400
 
-# Get current active event (if any)
+# Get current active events
 @app.route("/events/active", methods=["GET"])
-def get_active_event():
+def get_active_events():
+    
     now = datetime.now()
+    entity = request.args.get('entity')
+    
     active_events = [event for event in events_db if event.start_time <= now <= event.end_time]
     
-    # Return the most severe active event if multiple exist
-    if not active_events:
-        return jsonify(None)
+    # Filter by requesting entity if provided
+    if entity:
+        active_events = [event for event in active_events if event.requesting_entity == entity]
     
-    # Prioritize Critical events over High events
-    critical_events = [e for e in active_events if e.level == EventLevel.CRITICAL]
-    if critical_events:
-        return jsonify(critical_events[0].to_dict())
-    
-    return jsonify(active_events[0].to_dict())
+    # Return all active events as a list of dictionaries
+    return jsonify([event.to_dict() for event in active_events])
 
 # Get future events
 @app.route("/events/future", methods=["GET"])
 def get_future_events():
     now = datetime.now()
-    future_events = [event.to_dict() for event in events_db if event.start_time > now]
-    return jsonify(future_events)
-
-# Get upcoming event (soonest future event)
-@app.route("/events/upcoming", methods=["GET"])
-def get_upcoming_event():
-    now = datetime.now()
+    entity = request.args.get('entity')
+    
     future_events = [event for event in events_db if event.start_time > now]
     
-    if not future_events:
-        return jsonify(None)
-    
-    # Sort by start time and return the soonest event
-    soonest_event = sorted(future_events, key=lambda e: e.start_time)[0]
-    return jsonify(soonest_event.to_dict())
+    # Filter by requesting entity if provided
+    if entity:
+        future_events = [event for event in future_events if event.requesting_entity == entity]
+        
+    return jsonify([event.to_dict() for event in future_events])
 
-# Get all events (optionally filter by status)
+# Get all events (optionally filter by status and/or entity)
 @app.route("/events/", methods=["GET"])
 def get_events():
+    
     status = request.args.get('status', 'all').lower()
+    entity = request.args.get('entity')
     now = datetime.now()
     
+    # First filter by status
     if status == 'all':
-        return jsonify([event.to_dict() for event in events_db])
+        filtered_events = events_db
     elif status == 'active':
-        active_events = [event.to_dict() for event in events_db if event.start_time <= now <= event.end_time]
-        return jsonify(active_events)
+        filtered_events = [event for event in events_db if event.start_time <= now <= event.end_time]
     elif status == 'future':
-        future_events = [event.to_dict() for event in events_db if event.start_time > now]
-        return jsonify(future_events)
+        filtered_events = [event for event in events_db if event.start_time > now]
     elif status == 'past':
-        past_events = [event.to_dict() for event in events_db if event.end_time < now]
-        return jsonify(past_events)
+        filtered_events = [event for event in events_db if event.end_time < now]
     else:
         return jsonify({"error": "Invalid status parameter. Use 'all', 'active', 'future', or 'past'"}), 400
+    
+    # Then filter by entity if provided
+    if entity:
+        filtered_events = [event for event in filtered_events if event.requesting_entity == entity]
+    
+    return jsonify([event.to_dict() for event in filtered_events])
 
 if __name__ == "__main__":
     app.run(debug=True)
