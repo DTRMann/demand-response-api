@@ -1,5 +1,4 @@
 from flask import Flask, request, jsonify, abort
-from enum import Enum
 from datetime import datetime
 import uuid
 from typing import Dict, Any
@@ -10,13 +9,9 @@ app = Flask(__name__)
 # Events database
 events_db = []
 
-class EventLevel(str, Enum):
-    HIGH = "High"
-    CRITICAL = "Critical"
-
 @dataclass
 class DemandResponseEvent:
-    level: EventLevel
+    
     start_time: datetime
     end_time: datetime
     requesting_entity: str  # Required field for requesting entity
@@ -35,17 +30,16 @@ class DemandResponseEvent:
     
     def to_dict(self):
         result = asdict(self)
-        result['level'] = self.level.value
         result['start_time'] = self.start_time.isoformat()
         result['end_time'] = self.end_time.isoformat()
         return result
 
 # Convert JSON to DemandResponseEvent
 def parse_event_data(data):
+    
     try:
         data['start_time'] = datetime.fromisoformat(data['start_time'])
         data['end_time'] = datetime.fromisoformat(data['end_time'])
-        data['level'] = EventLevel(data['level'])
     except KeyError as e:
         raise ValueError(f"Missing required field: {e.args[0]}")
     except (ValueError, TypeError) as e:
@@ -69,7 +63,7 @@ def create_event():
     
     events_db.append(event)
     
-    return jsonify(event.to_dict()), 200
+    return jsonify(event.to_dict()), 201
 
 # Get current active events
 @app.route("/events/active", methods=["GET"])
@@ -90,6 +84,7 @@ def get_active_events():
 # Get future events
 @app.route("/events/future", methods=["GET"])
 def get_future_events():
+    
     now = datetime.now()
     entity = request.args.get('entity')
     
@@ -107,6 +102,8 @@ def get_events():
     
     status = request.args.get('status', 'all').lower()
     entity = request.args.get('entity')
+    metadata_key = request.args.get('metadata_key')
+    metadata_value = request.args.get('metadata_value')
     now = datetime.now()
     
     # First filter by status
@@ -125,10 +122,80 @@ def get_events():
     if entity:
         filtered_events = [event for event in filtered_events if event.requesting_entity == entity]
     
+    # Filter by metadata if both key and value are provided
+    if metadata_key and metadata_value:
+        filtered_events = [
+            event for event in filtered_events 
+            if metadata_key in event.metadata and event.metadata[metadata_key] == metadata_value
+        ]
+    # Filter by metadata key only
+    elif metadata_key:
+        filtered_events = [
+            event for event in filtered_events 
+            if metadata_key in event.metadata
+        ]
+    
     return jsonify([event.to_dict() for event in filtered_events])
+
+# Get a specific event by ID
+@app.route("/events/<event_id>", methods=["GET"])
+def get_event(event_id):
+    
+    event = next((e for e in events_db if e.id == event_id), None)
+    
+    if not event:
+        abort(404, description=f"Event with ID {event_id} not found")
+    
+    return jsonify(event.to_dict())
+
+# Update an existing event
+@app.route("/events/<event_id>", methods=["PUT"])
+def update_event(event_id):
+    
+    event = next((e for e in events_db if e.id == event_id), None)
+    
+    if not event:
+        abort(404, description=f"Event with ID {event_id} not found")
+    
+    data = request.get_json()
+    
+    if not data:
+        abort(400, description="No input provided")
+    
+    # Preserve the ID
+    data['id'] = event_id
+    
+    try:
+        # Remove the old event
+        events_db.remove(event)
+        # Create updated event
+        updated_event = parse_event_data(data)
+        # Add to database
+        events_db.append(updated_event)
+    except ValueError as e:
+        # If there was an error, add the original event back
+        events_db.append(event)
+        abort(400, description=str(e))
+    
+    return jsonify(updated_event.to_dict())
+
+# Delete an event
+@app.route("/events/<event_id>", methods=["DELETE"])
+def delete_event(event_id):
+    
+    event = next((e for e in events_db if e.id == event_id), None)
+    
+    if not event:
+        abort(404, description=f"Event with ID {event_id} not found")
+    
+    events_db.remove(event)
+    
+    return jsonify({
+        "id": event_id,
+        "message": "Event deleted successfully"
+    })
 
 if __name__ == "__main__":
     app.run(debug=True)
-
 
 
