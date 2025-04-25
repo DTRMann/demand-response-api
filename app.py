@@ -3,6 +3,12 @@ from datetime import datetime
 import uuid
 from typing import Dict, Any
 from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, available_timezones
+
+# From python scripts
+from tzHandlingHelpers import get_utc_now
+
 
 app = Flask(__name__)
 
@@ -14,36 +20,120 @@ class DemandResponseEvent:
     
     start_time: datetime
     end_time: datetime
-    requesting_entity: str  # Required field for requesting entity
+    requesting_entity: str
     timezone: str = "UTC"  # Default timezone
     message: str = ""
-    metadata: Dict[str, Any] = field(default_factory=dict)  # Flexible metadata field
+    metadata: Dict[str, Any] = field(default_factory=dict)
     id: str = None
     
     def __post_init__(self):
         if self.id is None:
             self.id = str(uuid.uuid4())
         
-        # Validate required requesting_entity field
+        # Validate requesting_entity
         if not self.requesting_entity:
             raise ValueError("requesting_entity is required")
+            
+        # Validate timezone
+        try:
+            ZoneInfo(self.timezone)
+        except Exception as e:
+            raise ValueError(f"Invalid timezone '{self.timezone}': {str(e)}")
+            
+        # Ensure datetime objects are timezone-aware in UTC
+        if self.start_time.tzinfo is None:
+            raise ValueError("start_time must include timezone information")
+        if self.end_time.tzinfo is None:
+            raise ValueError("end_time must include timezone information")
+            
+        # Convert to UTC for storage
+        self.start_time = self.start_time.astimezone(ZoneInfo("UTC"))
+        self.end_time = self.end_time.astimezone(ZoneInfo("UTC"))
     
     def to_dict(self):
+        """Convert to dict, with timezone-aware ISO format strings"""
         result = asdict(self)
         result['start_time'] = self.start_time.isoformat()
         result['end_time'] = self.end_time.isoformat()
         return result
+        
+    def to_local_dict(self):
+        """Convert to dict with times in the event's specified timezone"""
+        result = asdict(self)
+        try:
+            # Convert to the timezone specified in the event
+            tz = ZoneInfo(self.timezone)
+            result['start_time'] = self.start_time.astimezone(tz).isoformat()
+            result['end_time'] = self.end_time.astimezone(tz).isoformat()
+        except:
+            # Fallback to UTC if timezone is invalid
+            result['start_time'] = self.start_time.isoformat()
+            result['end_time'] = self.end_time.isoformat()
+        return result
 
 # Convert JSON to DemandResponseEvent
 def parse_event_data(data):
-    
+    """Parse JSON input into a DemandResponseEvent with user-friendly date handling"""
     try:
-        data['start_time'] = datetime.fromisoformat(data['start_time'])
-        data['end_time'] = datetime.fromisoformat(data['end_time'])
+        # Get the user's timezone from request
+        user_timezone = data.get('timezone', 'UTC')
+        
+        # Validate timezone early
+        try:
+            tz = ZoneInfo(user_timezone)
+        except Exception as e:
+            raise ValueError(f"Invalid timezone '{user_timezone}': {str(e)}")
+        
+        # Get the time strings from input
+        start_time_str = data['start_time']
+        end_time_str = data['end_time']
+        
+        # Try multiple formats for user convenience
+        formats = [
+            # ISO format
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%dT%H:%M",
+            # Common date formats
+            "%Y/%m/%d %H:%M:%S",
+            "%Y/%m/%d %H:%M",
+            "%m/%d/%Y %H:%M:%S",
+            "%m/%d/%Y %H:%M"
+        ]
+        
+        # Try to parse start_time with multiple formats
+        start_time = None
+        for fmt in formats:
+            try:
+                # Parse as naive datetime, then assign the specified timezone
+                start_time = datetime.strptime(start_time_str, fmt).replace(tzinfo=tz)
+                break
+            except ValueError:
+                continue
+                
+        if start_time is None:
+            raise ValueError(f"Could not parse start_time: '{start_time_str}'. Please use a format like '2025/04/24 14:30'")
+            
+        # Try to parse end_time with multiple formats
+        end_time = None
+        for fmt in formats:
+            try:
+                # Parse as naive datetime, then assign the specified timezone
+                end_time = datetime.strptime(end_time_str, fmt).replace(tzinfo=tz)
+                break
+            except ValueError:
+                continue
+                
+        if end_time is None:
+            raise ValueError(f"Could not parse end_time: '{end_time_str}'. Please use a format like '2025/04/24 14:30'")
+            
+        # Update the data dict with parsed datetime objects
+        data['start_time'] = start_time
+        data['end_time'] = end_time
+        
     except KeyError as e:
         raise ValueError(f"Missing required field: {e.args[0]}")
     except (ValueError, TypeError) as e:
-        raise ValueError(f"Invalid input: {str(e)}")
+        raise ValueError(f"Invalid date format: {str(e)}")
     
     return DemandResponseEvent(**data)
 
@@ -68,9 +158,11 @@ def create_event():
 # Get current active events
 @app.route("/events/active", methods=["GET"])
 def get_active_events():
+    # Get current time in UTC with timezone info
+    now = get_utc_now()
     
-    now = datetime.now()
     entity = request.args.get('entity')
+    output_timezone = request.args.get('output_timezone')
     
     active_events = [event for event in events_db if event.start_time <= now <= event.end_time]
     
@@ -78,8 +170,26 @@ def get_active_events():
     if entity:
         active_events = [event for event in active_events if event.requesting_entity == entity]
     
-    # Return all active events as a list of dictionaries
-    return jsonify([event.to_dict() for event in active_events])
+    # Process each event for output
+    result = []
+    for event in active_events:
+        event_dict = event.to_dict()
+        
+        # If output_timezone is specified, convert the times
+        if output_timezone:
+            try:
+                output_tz = ZoneInfo(output_timezone)
+                event_dict['start_time'] = event.start_time.astimezone(output_tz).isoformat()
+                event_dict['end_time'] = event.end_time.astimezone(output_tz).isoformat()
+            except:
+                
+                print('Timezone invalid')
+                
+                pass
+        
+        result.append(event_dict)
+    
+    return jsonify(result)
 
 # Get future events
 @app.route("/events/future", methods=["GET"])
