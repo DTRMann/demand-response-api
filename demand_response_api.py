@@ -4,38 +4,48 @@ import sqlite3
 import uuid
 from flask import Flask, request, jsonify, abort, g
 from datetime import datetime, timezone
-from pydantic import BaseModel, ValidationError, validator
-from typing import Optional, Dict
+from pydantic import BaseModel, ValidationError, field_validator, constr, Field
+from typing import Dict, Any
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024  # 100 KB
 DB_PATH = 'events.db'
 
 # Request validation
 class EventSchema(BaseModel):
     start_time: datetime
     end_time: datetime
-    entity: str
-    message: Optional[str] = ''
-    metadata: Dict = {}
+    entity: constr(strip_whitespace=True, max_length=100)
+    message: constr(max_length=500) = ''
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
-    @validator('start_time', 'end_time')
+    @field_validator('start_time', 'end_time')
+    @classmethod
     def must_be_utc(cls, v):
         if v.tzinfo is None:
             raise ValueError('timestamp must include timezone')
-        # normalize to UTC
         return v.astimezone(timezone.utc)
+    
+    @field_validator('metadata')
+    @classmethod
+    def metadata_size_limit(cls, v, info):
+        size = len(json.dumps(v))
+        if size > 3000:
+            # Defensive warning for large but still acceptable payloads
+            logging.warning("Large metadata payload (~%d bytes) for entity: %s", size, info.data.get('entity', 'unknown'))
+        if size > 4000:
+            raise ValueError('metadata must be smaller than 4000 bytes')
+        return v
 
 # per-request DB connection
 def get_db():
     if 'db' not in g:
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
-        # enforce WAL for better concurrency
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA synchronous = NORMAL")
         g.db = conn
     return g.db
 
@@ -46,11 +56,6 @@ def close_db(_exc):
         db.close()
 
 def db_execute(query, params=(), fetch=False, many=False):
-    """
-    Returns:
-      - If fetch: list of rows
-      - Else: int of affected rows
-    """
     conn = get_db()
     c = conn.cursor()
     if many:
@@ -58,43 +63,38 @@ def db_execute(query, params=(), fetch=False, many=False):
     else:
         c.execute(query, params)
     conn.commit()
-    if fetch:
-        return c.fetchall()
-    return c.rowcount
+    return c.fetchall() if fetch else c.rowcount
 
 # Initialize database with integer times
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS events (
-            id TEXT PRIMARY KEY,
-            start_time INTEGER NOT NULL,
-            end_time INTEGER NOT NULL,
-            entity TEXT NOT NULL,
-            message TEXT,
-            metadata TEXT
-        )
-    ''')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_start ON events(start_time)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_end ON events(end_time)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_entity ON events(entity)')
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS events (
+                id TEXT PRIMARY KEY,
+                start_time INTEGER NOT NULL,
+                end_time INTEGER NOT NULL,
+                entity TEXT NOT NULL,
+                message TEXT,
+                metadata TEXT
+            )
+        ''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_start ON events(start_time)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_end ON events(end_time)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_entity ON events(entity)')
+        conn.commit()
 
 def epoch_to_iso(ts_int: int) -> str:
     return datetime.fromtimestamp(ts_int, tz=timezone.utc).isoformat()
 
-# --- CRUD operations ---
-
 @app.route('/events', methods=['POST'])
 def create_event():
-    
     raw = request.get_json() or abort(400, description='Invalid JSON body')
     try:
         ev = EventSchema(**raw)
     except ValidationError as e:
         abort(400, description=e.json())
+
     eid = str(uuid.uuid4())
     st_i = int(ev.start_time.timestamp())
     et_i = int(ev.end_time.timestamp())
@@ -105,14 +105,15 @@ def create_event():
             'INSERT INTO events(id, start_time, end_time, entity, message, metadata) VALUES (?,?,?,?,?,?)',
             (eid, st_i, et_i, ev.entity, ev.message, meta_json)
         )
+        logger.info(f"Event {eid} created")
     except sqlite3.IntegrityError as e:
-        logging.error("DB insert failed: %s", e)
+        logger.error("DB insert failed: %s", e)
         abort(500, description='Could not create event')
+
     return jsonify({'id': eid}), 201
 
 @app.route('/events', methods=['GET'])
 def list_events():
-    
     status = request.args.get('status', 'all')
     now_i = int(datetime.utcnow().replace(tzinfo=timezone.utc).timestamp())
     params = []
@@ -138,21 +139,19 @@ def list_events():
         q += ' WHERE ' + ' AND '.join(filters)
 
     rows = db_execute(q, tuple(params), fetch=True)
-    out = []
-    for r in rows:
-        out.append({
+    return jsonify([
+        {
             'id': r['id'],
             'start_time': epoch_to_iso(r['start_time']),
-            'end_time':   epoch_to_iso(r['end_time']),
-            'entity':     r['entity'],
-            'message':    r['message'],
-            'metadata':   json.loads(r['metadata'] or '{}')
-        })
-    return jsonify(out)
+            'end_time': epoch_to_iso(r['end_time']),
+            'entity': r['entity'],
+            'message': r['message'],
+            'metadata': json.loads(r['metadata'] or '{}')
+        } for r in rows
+    ])
 
-@app.route('/events/<eid>', methods=['GET','PUT','DELETE'])
+@app.route('/events/<eid>', methods=['GET', 'PUT', 'DELETE'])
 def event_detail(eid):
-    
     if request.method == 'GET':
         rows = db_execute('SELECT * FROM events WHERE id = ?', (eid,), fetch=True)
         if not rows:
@@ -161,18 +160,19 @@ def event_detail(eid):
         return jsonify({
             'id': r['id'],
             'start_time': epoch_to_iso(r['start_time']),
-            'end_time':   epoch_to_iso(r['end_time']),
-            'entity':     r['entity'],
-            'message':    r['message'],
-            'metadata':   json.loads(r['metadata'] or '{}')
+            'end_time': epoch_to_iso(r['end_time']),
+            'entity': r['entity'],
+            'message': r['message'],
+            'metadata': json.loads(r['metadata'] or '{}')
         })
 
-    if request.method == 'PUT':
+    elif request.method == 'PUT':
         raw = request.get_json() or abort(400, description='Invalid JSON body')
         try:
             ev = EventSchema(**raw)
         except ValidationError as e:
             abort(400, description=e.json())
+
         st_i = int(ev.start_time.timestamp())
         et_i = int(ev.end_time.timestamp())
         meta_json = json.dumps(ev.metadata)
@@ -183,15 +183,22 @@ def event_detail(eid):
         )
         if rowcount == 0:
             abort(404, description='Event not found')
+        logging.info(f"Event {eid} updated")
         return jsonify({'id': eid})
 
-    rowcount = db_execute('DELETE FROM events WHERE id=?', (eid,))
-    if rowcount == 0:
-        abort(404, description='Event not found')
-    return jsonify({'id': eid}), 200
+    elif request.method == 'DELETE':
+        rowcount = db_execute('DELETE FROM events WHERE id=?', (eid,))
+        if rowcount == 0:
+            abort(404, description='Event not found')
+        logging.info(f"Event {eid} deleted")
+        return jsonify({'id': eid}), 200
+
+    else:
+        abort(405)
 
 if __name__ == '__main__':
     init_db()
-    app.run()
+    app.run(debug=True)
+
 
 

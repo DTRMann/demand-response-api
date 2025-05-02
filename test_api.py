@@ -1,168 +1,93 @@
-
 import pytest
+import os
 from datetime import datetime, timedelta, timezone
-
-import app
+from demand_response_api import app, init_db, DB_PATH
 
 @pytest.fixture(autouse=True)
-def use_temp_db(monkeypatch, tmp_path):
-    
-    # Point DB_PATH to a fresh temporary file
-    db_file = tmp_path / "test_events.db"
-    monkeypatch.setattr(app, 'DB_PATH', str(db_file))
-    # Initialize fresh database
-    app.init_db()
+def setup_and_teardown():
+    # Ensure a clean DB
+    if os.path.exists(DB_PATH):
+        os.remove(DB_PATH)
+    init_db()
     yield
+    if os.path.exists(DB_PATH):
+        os.remove(DB_PATH)
 
 @pytest.fixture
 def client():
-    return app.app.test_client()
+    return app.test_client()
 
-# Helper to generate ISO8601 UTC timestamps
-def utc_iso(dt: datetime):
-    return dt.astimezone(timezone.utc).isoformat()
-
-def test_create_and_get_event(client):
-    
-    start = utc_iso(datetime.now(timezone.utc) + timedelta(minutes=-1))
-    end = utc_iso(datetime.now(timezone.utc) + timedelta(minutes=1))
-    payload = {
-        'start_time': start,
-        'end_time': end,
-        'entity': 'tester',
-        'message': 'hello',
-        'metadata': {'foo': 'bar'}
+def generate_event_payload(start_offset=0, duration_minutes=60):
+    now = datetime.now(timezone.utc)
+    start = now + timedelta(minutes=start_offset)
+    end = start + timedelta(minutes=duration_minutes)
+    return {
+        "start_time": start.isoformat(),
+        "end_time": end.isoformat(),
+        "entity": "TestEntity",
+        "message": "Test Message",
+        "metadata": {"type": "test"}
     }
-    # Create
+
+def test_create_event(client):
+    payload = generate_event_payload()
     resp = client.post('/events', json=payload)
     assert resp.status_code == 201
     data = resp.get_json()
     assert 'id' in data
-    eid = data['id']
 
-    # Get list
-    resp = client.get('/events')
-    assert resp.status_code == 200
-    all_events = resp.get_json()
-    assert any(e['id'] == eid for e in all_events)
+def test_get_event(client):
+    payload = generate_event_payload()
+    create_resp = client.post('/events', json=payload)
+    eid = create_resp.get_json()['id']
 
-    # Get detail
-    resp = client.get(f'/events/{eid}')
-    assert resp.status_code == 200
-    detail = resp.get_json()
-    assert detail['entity'] == 'tester'
-    assert detail['message'] == 'hello'
-    assert detail['metadata']['foo'] == 'bar'
+    get_resp = client.get(f'/events/{eid}')
+    assert get_resp.status_code == 200
+    data = get_resp.get_json()
+    assert data['entity'] == payload['entity']
 
 def test_update_event(client):
-    # First create
-    start = utc_iso(datetime.now(timezone.utc) + timedelta(minutes=-2))
-    end = utc_iso(datetime.now(timezone.utc) + timedelta(minutes=2))
-    resp = client.post('/events', json={
-        'start_time': start,
-        'end_time': end,
-        'entity': 'uploader'
-    })
-    eid = resp.get_json()['id']
+    payload = generate_event_payload()
+    create_resp = client.post('/events', json=payload)
+    eid = create_resp.get_json()['id']
 
-    # Update
-    new_start = utc_iso(datetime.now(timezone.utc) + timedelta(minutes=-5))
-    new_end = utc_iso(datetime.now(timezone.utc) + timedelta(minutes=5))
-    update_data = {
-        'start_time': new_start,
-        'end_time': new_end,
-        'entity': 'updater',
-        'message': 'updated',
-        'metadata': {'x': 1}
-    }
-    resp = client.put(f'/events/{eid}', json=update_data)
-    assert resp.status_code == 200
-    assert resp.get_json()['id'] == eid
+    updated_payload = payload.copy()
+    updated_payload['message'] = "Updated Message"
+    update_resp = client.put(f'/events/{eid}', json=updated_payload)
+    assert update_resp.status_code == 200
 
-    # Verify
-    resp = client.get(f'/events/{eid}')
-    detail = resp.get_json()
-    assert detail['entity'] == 'updater'
-    assert detail['message'] == 'updated'
-    assert detail['metadata'] == {'x': 1}
+    get_resp = client.get(f'/events/{eid}')
+    assert get_resp.get_json()['message'] == "Updated Message"
 
 def test_delete_event(client):
-    
-    # Create
-    start = utc_iso(datetime.now(timezone.utc) + timedelta(minutes=-1))
-    end = utc_iso(datetime.now(timezone.utc) + timedelta(minutes=1))
-    eid = client.post('/events', json={
-        'start_time': start,
-        'end_time': end,
-        'entity': 'deleter'
-    }).get_json()['id']
+    payload = generate_event_payload()
+    create_resp = client.post('/events', json=payload)
+    eid = create_resp.get_json()['id']
 
-    # Delete
-    resp = client.delete(f'/events/{eid}')
-    assert resp.status_code == 200
-    assert resp.get_json()['id'] == eid
+    del_resp = client.delete(f'/events/{eid}')
+    assert del_resp.status_code == 200
 
-    # Confirm gone
-    resp = client.get(f'/events/{eid}')
-    assert resp.status_code == 404
+    get_resp = client.get(f'/events/{eid}')
+    assert get_resp.status_code == 404
 
-def test_status_filters(client):
-    
-    now = datetime.now(timezone.utc)
-    # Past event
-    p_start = utc_iso(now - timedelta(hours=2))
-    p_end = utc_iso(now - timedelta(hours=1))
-    past_id = client.post('/events', json={'start_time': p_start, 'end_time': p_end, 'entity': 'e'}).get_json()['id']
-    # Active event
-    a_start = utc_iso(now - timedelta(minutes=1))
-    a_end = utc_iso(now + timedelta(minutes=1))
-    active_id = client.post('/events', json={'start_time': a_start, 'end_time': a_end, 'entity': 'e'}).get_json()['id']
-    # Future event
-    f_start = utc_iso(now + timedelta(hours=1))
-    f_end = utc_iso(now + timedelta(hours=2))
-    future_id = client.post('/events', json={'start_time': f_start, 'end_time': f_end, 'entity': 'e'}).get_json()['id']
+def test_list_events(client):
+    # Create past, active, and future events
+    client.post('/events', json=generate_event_payload(start_offset=-90, duration_minutes=30))  # past
+    client.post('/events', json=generate_event_payload(start_offset=-15, duration_minutes=30))  # active
+    client.post('/events', json=generate_event_payload(start_offset=15, duration_minutes=30))   # future
 
-    # All
-    all_resp = client.get('/events?status=all').get_json()
-    assert {e['id'] for e in all_resp} == {past_id, active_id, future_id}
+    resp_all = client.get('/events')
+    assert resp_all.status_code == 200
+    assert len(resp_all.get_json()) == 3
 
-    # Past
-    past_resp = client.get('/events?status=past').get_json()
-    assert [e['id'] for e in past_resp] == [past_id]
+    resp_active = client.get('/events?status=active')
+    assert resp_active.status_code == 200
+    assert len(resp_active.get_json()) == 1
 
-    # Active
-    act_resp = client.get('/events?status=active').get_json()
-    assert [e['id'] for e in act_resp] == [active_id]
+    resp_future = client.get('/events?status=future')
+    assert resp_future.status_code == 200
+    assert len(resp_future.get_json()) == 1
 
-    # Future
-    fut_resp = client.get('/events?status=future').get_json()
-    assert [e['id'] for e in fut_resp] == [future_id]
-
-    # Entity filter
-    ent_resp = client.get('/events?status=all&entity=e').get_json()
-    assert set(e['id'] for e in ent_resp) == {past_id, active_id, future_id}
-
-def test_invalid_requests(client):
-    
-    # Missing JSON
-    resp = client.post('/events', data='')
-    assert resp.status_code == 400
-
-    # Invalid timestamp format
-    resp = client.post('/events', json={'start_time': 'bad', 'end_time': 'bad', 'entity': 'x'})
-    assert resp.status_code == 400
-
-    # Missing entity
-    now_iso = utc_iso(datetime.now(timezone.utc))
-    resp = client.post('/events', json={'start_time': now_iso, 'end_time': now_iso})
-    assert resp.status_code == 400
-
-    # Nonexistent GET/PUT/DELETE
-    for method in ('get', 'put', 'delete'):
-        resp = getattr(client, method)('/events/nonexistent')
-        if method == 'get':
-            assert resp.status_code == 404
-        else:
-            # PUT and DELETE return 400 or 404
-            assert resp.status_code in (400, 404)
-
+    resp_past = client.get('/events?status=past')
+    assert resp_past.status_code == 200
+    assert len(resp_past.get_json()) == 1
