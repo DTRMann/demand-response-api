@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024  # 100 KB
+app.config['DB_CONN'] = None # Allows toggle between in memory db for prod and RAM for testing
 DB_PATH = 'events.db'
 
 # Request validation
@@ -44,15 +45,19 @@ class EventSchema(BaseModel):
 # per-request DB connection
 def get_db():
     if 'db' not in g:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        g.db = conn
+        if app.config['DB_CONN']:
+            g.db = app.config['DB_CONN']
+        else:
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            g.db = conn
     return g.db
 
 @app.teardown_appcontext
 def close_db(_exc):
     db = g.pop('db', None)
-    if db:
+    # Don't close if it's a test connection managed by pytest fixtures
+    if db and not app.config.get('TESTING'):
         db.close()
 
 def db_execute(query, params=(), fetch=False, many=False):
@@ -65,9 +70,11 @@ def db_execute(query, params=(), fetch=False, many=False):
     conn.commit()
     return c.fetchall() if fetch else c.rowcount
 
-# Initialize database with integer times
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
+# Initialize database with integer times. In memory db used for testing
+def init_db(conn=None):
+    if conn is None:
+        conn = sqlite3.connect(DB_PATH)
+    with conn:
         c = conn.cursor()
         c.execute('''
             CREATE TABLE IF NOT EXISTS events (

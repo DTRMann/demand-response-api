@@ -1,24 +1,28 @@
 import pytest
-import os
+import sqlite3
 from datetime import datetime, timedelta, timezone
-from demand_response_api import app, init_db, DB_PATH
 
-@pytest.fixture(autouse=True)
-def setup_and_teardown():
-    # Ensure a clean DB
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
-    init_db()
-    yield
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
+from demand_response_api import app, init_db
 
 @pytest.fixture
-def client():
-    return app.test_client()
+def db_conn():
+    # New in-memory db created for each test
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    init_db(conn)
+    yield conn
+    conn.close()
+
+@pytest.fixture
+def client(db_conn):
+    app.config['DB_CONN'] = db_conn
+    app.config['TESTING'] = True # Prevent teardown from using local memory
+    with app.test_client() as c:
+        yield c
 
 def generate_event_payload(start_offset=0, duration_minutes=60):
     now = datetime.now(timezone.utc)
+    now = now.replace(minute=0, second=0, microsecond=0) # Round down to beginning of current hour
     start = now + timedelta(minutes=start_offset)
     end = start + timedelta(minutes=duration_minutes)
     return {
@@ -29,6 +33,7 @@ def generate_event_payload(start_offset=0, duration_minutes=60):
         "metadata": {"type": "test"}
     }
 
+# Test crud
 def test_create_event(client):
     payload = generate_event_payload()
     resp = client.post('/events', json=payload)
@@ -71,10 +76,9 @@ def test_delete_event(client):
     assert get_resp.status_code == 404
 
 def test_list_events(client):
-    # Create past, active, and future events
     client.post('/events', json=generate_event_payload(start_offset=-90, duration_minutes=30))  # past
-    client.post('/events', json=generate_event_payload(start_offset=-15, duration_minutes=30))  # active
-    client.post('/events', json=generate_event_payload(start_offset=15, duration_minutes=30))   # future
+    client.post('/events', json=generate_event_payload(start_offset=0, duration_minutes=90))  # active
+    client.post('/events', json=generate_event_payload(start_offset=90, duration_minutes=30))   # future
 
     resp_all = client.get('/events')
     assert resp_all.status_code == 200
