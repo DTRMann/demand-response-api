@@ -1,0 +1,149 @@
+openapi: 3.0.3
+info:
+  title: Demand Response API
+  version: 1.0.0
+  description: API to create, retrieve, update, and delete demand response events.
+
+paths:
+  /events:
+    post:
+      summary: Create a new event
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Event'
+      responses:
+        '201':
+          description: Event created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+
+    get:
+      summary: List events
+      parameters:
+        - in: query
+          name: status
+          schema:
+            type: string
+            enum: [all, active, future, past]
+          description: Filter events by time status
+        - in: query
+          name: entity
+          schema:
+            type: string
+          description: Filter events by entity
+      responses:
+        '200':
+          description: List of events
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/EventWithId'
+
+  /events/{id}:
+    get:
+      summary: Get an event by ID
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Event details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EventWithId'
+        '404':
+          description: Event not found
+
+    put:
+      summary: Update an existing event
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Event'
+      responses:
+        '200':
+          description: Event updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+        '404':
+          description: Event not found
+
+    delete:
+      summary: Delete an event
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Event deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+        '404':
+          description: Event not found
+
+components:
+  schemas:
+    Event:
+      type: object
+      required: [start_time, end_time, entity]
+      properties:
+        start_time:
+          type: string
+          format: date-time
+          description: UTC start time (must include timezone)
+        end_time:
+          type: string
+          format: date-time
+          description: UTC end time (must include timezone)
+        entity:
+          type: string
+          maxLength: 100
+        message:
+          type: string
+          maxLength: 500
+        metadata:
+          type: object
+          additionalProperties: true
+
+    EventWithId:
+      allOf:
+        - $ref: '#/components/schemas/Event'
+        - type: object
+          properties:
+            id:
+              type: string
